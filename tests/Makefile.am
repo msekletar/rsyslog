@@ -602,6 +602,7 @@ TESTS += sndrcv_relp.sh \
 if ENABLE_GNUTLS
 TESTS += \
          sndrcv_relp_tls.sh \
+         sndrcv_relp_tls_prio.sh \
          relp_tls_certificate_not_found.sh
 endif
 endif
