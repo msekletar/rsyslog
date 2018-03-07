@@ -115,6 +115,7 @@ static int bPidFallBack;
 static ratelimit_t *ratelimiter = NULL;
 static sd_journal *j;
 static int j_inotify_fd;
+static char *last_cursor = NULL;
 
 #define J_PROCESS_PERIOD 1024  /* Call sd_journal_process() every 1,024 records */
 
@@ -270,6 +271,7 @@ readjournal(void)
 	char *message = NULL;
 	char *sys_iden;
 	char *sys_iden_help = NULL;
+	char *c = NULL;
 
 	const void *get;
 	const void *pidget;
@@ -413,6 +415,13 @@ readjournal(void)
 		tv.tv_usec = timestamp % 1000000;
 	}
 
+	/* save journal cursor (at this point we can be sure it is valid) */
+	sd_journal_get_cursor(j, &c);
+	if (c) {
+		free(last_cursor);
+		last_cursor = c;
+	}
+
 	/* submit message */
 	enqMsg((uchar *)message, (uchar *) sys_iden_help, facility, severity, &tv, json, 0);
 
@@ -431,83 +440,72 @@ persistJournalState(void)
 	DEFiRet;
 	FILE *sf; /* state file */
 	char tmp_sf[MAXFNAME];
-	char *cursor;
-	int ret = 0;
+	size_t n;
 
-	/* On success, sd_journal_get_cursor() returns 1 in systemd
-	   197 or older and 0 in systemd 198 or newer */
-	if ((ret = sd_journal_get_cursor(j, &cursor)) >= 0) {
-               /* we create a temporary name by adding a ".tmp"
-                * suffix to the end of our state file's name
-                */
-               snprintf(tmp_sf, sizeof(tmp_sf), "%s.tmp", cs.stateFile);
-               if ((sf = fopen(tmp_sf, "wb")) != NULL) {
-			if (fprintf(sf, "%s", cursor) < 0) {
-				iRet = RS_RET_IO_ERROR;
-			}
-			fclose(sf);
-			free(cursor);
-                       /* change the name of the file to the configured one */
-                       if (iRet == RS_RET_OK && rename(tmp_sf, cs.stateFile) == -1) {
-                               LogError(errno, iRet, "imjournal: rename() failed: "
-                                       "for new path: '%s'", cs.stateFile);
-                               iRet = RS_RET_IO_ERROR;
-                       }
-
-		} else {
-			LogError(errno, RS_RET_FOPEN_FAILURE, "imjournal: fopen() failed "
-				"for path: '%s'", tmp_sf);
-			iRet = RS_RET_FOPEN_FAILURE;
-		}
-	} else {
-		LogError(-ret, RS_RET_ERR, "imjournal: sd_journal_get_cursor() failed");
-		iRet = RS_RET_ERR;
+	/* first check that we have valid cursor */
+	if (!last_cursor) {
+		ABORT_FINALIZE(RS_RET_OK);
 	}
+
+	/* we create a temporary name by adding a ".tmp"
+	 * suffix to the end of our state file's name
+	 */
+	n = snprintf(tmp_sf, sizeof(tmp_sf), "%s.tmp", cs.stateFile);
+	if (n >= sizeof(tmp_sf)) { /* backup in case of too long path name */
+		strncpy(tmp_sf, cs.stateFile, sizeof(tmp_sf) - 5);
+		strcat(tmp_sf, ".tmp");
+	}
+
+	sf = fopen(tmp_sf, "wb");
+	if (sf == NULL) {
+		LogError(errno, RS_RET_FOPEN_FAILURE, "imjournal: fopen() failed for path: '%s'", tmp_sf);
+		ABORT_FINALIZE(RS_RET_FOPEN_FAILURE);
+	}
+
+	if(fputs(last_cursor, sf) == EOF) {
+		LogError(errno, RS_RET_IO_ERROR, "imjournal: failed to save cursor to: '%s'", tmp_sf);
+		ABORT_FINALIZE(RS_RET_IO_ERROR);
+	}
+
+	if (fclose(sf) == EOF) {
+		LogError(errno, RS_RET_IO_ERROR, "imjournal: fclose() failed for path: '%s'", tmp_sf);
+		ABORT_FINALIZE(RS_RET_IO_ERROR);
+	}
+
+	/* change the name of the file to the configured one */
+	if (rename(tmp_sf, cs.stateFile) < 0) {
+		LogError(errno, iRet, "imjournal: rename() failed for new path: '%s'", cs.stateFile);
+		ABORT_FINALIZE(RS_RET_IO_ERROR);
+	}
+
+finalize_it:
 	RETiRet;
 }
 
 
 static rsRetVal skipOldMessages(void);
-/* Polls the journal for new messages. Similar to sd_journal_wait()
- * except for the special handling of EINTR.
- */
 
-#define POLL_TIMEOUT 1000 /* timeout for poll is 1s */
+#define POLL_TIMEOUT 1000000 /* timeout for poll is 1s */
 
 static rsRetVal
 pollJournal(void)
 {
 	DEFiRet;
-	struct pollfd pollfd;
-	int err; // journal error code to process
-	int pr = 0;
+	int err;
 
-	pollfd.fd = j_inotify_fd;
-	pollfd.events = sd_journal_get_events(j);
-#ifdef NEW_JOURNAL
-	pr = poll(&pollfd, 1, POLL_TIMEOUT);
-#else
-	pr = poll(&pollfd, 1, -1);
-#endif
-	if (pr == -1) {
-		if (errno == EINTR) {
-			/* EINTR is also received during termination
-			 * so return now to check the term state.
-			 */
-			ABORT_FINALIZE(RS_RET_OK);
-		} else {
-			LogError(errno, RS_RET_ERR, "imjournal: poll() failed");
+	err = sd_journal_wait(j, POLL_TIMEOUT);
+	if (err == SD_JOURNAL_INVALIDATE) {
+		closeJournal();
+
+		iRet = openJournal();
+		if (iRet != RS_RET_OK) {
 			ABORT_FINALIZE(RS_RET_ERR);
 		}
-	}
-#ifndef NEW_JOURNAL
-	assert(pr == 1);
-#endif
 
-	err = sd_journal_process(j);
-	if (err < 0) {
-		LogError(-err, RS_RET_ERR, "imjournal: sd_journal_process() failed");
-		ABORT_FINALIZE(RS_RET_ERR);
+		if (cs.stateFile) {
+			iRet = loadJournalState();
+		}
+		LogMsg(0, RS_RET_OK, LOG_NOTICE, "imjournal: journal reloaded...");
 	}
 
 finalize_it:
