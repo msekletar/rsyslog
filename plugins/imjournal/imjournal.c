@@ -101,10 +101,16 @@ static struct cnfparamblk modpblk =
 	  modpdescr
 	};
 
+
+/* I'd turn this into normal constant */
 #define DFLT_persiststateinterval 10
+
+/* These should really become functions */
 #define DFLT_SEVERITY pri2sev(LOG_NOTICE)
 #define DFLT_FACILITY pri2fac(LOG_USER)
 
+/* Not sure why those weird type prefixes are used in fairly new code. Its not like compiler doesn't tell us if we don't get the types right,
+ * building type information into variable name is just a bad practice and hardly justifiable in 2018 */
 static int bLegacyCnfModGlobalsPermitted = 1;/* are legacy module-global config parameters permitted? */
 
 static prop_t *pInputName = NULL;
@@ -113,15 +119,23 @@ static prop_t *pLocalHostIP = NULL;	/* a pseudo-constant propterty for 127.0.0.1
 static const char *pidFieldName;	/* read-only after startup */
 static int bPidFallBack;
 static ratelimit_t *ratelimiter = NULL;
+
+
+/* Just for purposes of clarity I'd put those into separate struct, JournalContext or something like that */
+/* Also path to state file should probably become part of that struct */
 static sd_journal *j;
 static int j_inotify_fd;
 static char *last_cursor = NULL;
 
+/* Again, this should be proper C constant */
 #define J_PROCESS_PERIOD 1024  /* Call sd_journal_process() every 1,024 records */
 
 static rsRetVal persistJournalState(void);
 static rsRetVal loadJournalState(void);
 
+
+/* This should really return fully initialized, ready to use, JournalContext */
+/* Also this should most likely handle state file and seek properly */
 static rsRetVal openJournal(void) {
 	int r;
 	DEFiRet;
@@ -139,6 +153,8 @@ static rsRetVal openJournal(void) {
 	RETiRet;
 }
 
+/* This should be inverse to openJournal which currently isn't. openJournal doesn't handle
+ * loading state while this function stores the state */
 static void closeJournal(void) {
 	if (cs.stateFile) { /* can't persist without a state file */
 		persistJournalState();
@@ -147,6 +163,10 @@ static void closeJournal(void) {
 	j_inotify_fd = 0;
 }
 
+
+/* This function seems weird. It has return value, while at the same time it seems like it unconditionally returns
+   true. This is just wrong. strtol() can fail. Also pVal is void * while it is used at all places like int *. Probably
+   pVal type should be int* */
 
 /* ugly workaround to handle facility numbers; values
  * derived from names need to be eight times smaller,
@@ -252,7 +272,10 @@ finalize_it:
 	RETiRet;
 }
 
+/* This function is just too big. I'd split it into multiple functions short functions that are single purpose */
 
+
+/* Not sure what printk buffer means in the context of the comment */
 /* Read journal log while data are available, each read() reads one
  * record of printk buffer.
  */
@@ -289,7 +312,7 @@ readjournal(void)
 
 	/* Get message text */
 	if (sd_journal_get_data(j, "MESSAGE", &get, &length) < 0) {
-		message = strdup("");
+		message = strdup(""); /* unchecked memory allocation */
 	} else {
 		CHKiRet(sanitizeValue(((const char *)get) + 8, length - 8, &message));
 	}
@@ -297,7 +320,7 @@ readjournal(void)
 	/* Get message severity ("priority" in journald's terminology) */
 	if (sd_journal_get_data(j, "PRIORITY", &get, &length) >= 0) {
 		if (length == 10) {
-			severity = ((char *)get)[9] - '0';
+			severity = ((char *)get)[9] - '0';  /* This is too specific, and not related to reading journal. Should be separate function */
 			if (severity < 0 || 7 < severity) {
 				LogError(0, RS_RET_ERR, "imjournal: the value of the 'PRIORITY' field is "
 					"out of bounds: %d, resetting", severity);
@@ -312,7 +335,7 @@ readjournal(void)
 	/* Get syslog facility */
 	if (sd_journal_get_data(j, "SYSLOG_FACILITY", &get, &length) >= 0) {
 		// Note: the journal frequently contains invalid facilities!
-		if (length == 17 || length == 18) {
+		if (length == 17 || length == 18) {   /* This logic should be in separate function that would explain what constraints value is supposed to adhere to */
 			facility = ((char *)get)[16] - '0';
 			if (length == 18) {
 				facility *= 10;
@@ -324,7 +347,7 @@ readjournal(void)
 				facility = cs.iDfltFacility;
 			}
 		} else {
-			DBGPRINTF("The value of the 'FACILITY' field has an "
+			DBGPRINTF("The value of the 'FACILITY' field has an " /* Why is this logged only as debug message when incorrect priority is logged as error ? */
 				"unexpected length: %zu value: '%s'\n", length, (const char*)get);
 		}
 	}
@@ -349,6 +372,9 @@ readjournal(void)
 		r = asprintf(&sys_iden_help, "%s[%s]:", sys_iden, sys_pid);
 		free (sys_pid);
 	} else {
+                /* Not sure if this shouldn't be the other way around. IOW, imjournal should trust more kernel than log client,
+                   ince _PID is PID of sender of the log message while SYSLOG_PID is metadata provided in syslog protocol itself
+                   (moreover it is event not available on message that originate from non syslog clients) */
 		/* this is fallback, "SYSLOG_PID" doesn't exist so trying to get "_PID" property */
 		if (bPidFallBack && sd_journal_get_data(j, "_PID", &pidget, &pidlength) >= 0) {
 			char *sys_pid;
@@ -373,6 +399,7 @@ readjournal(void)
 		ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
 	}
 
+        /* Is the construction of json blob really necessary on every message, it seems expensive. Is it always needed? */
 	json = json_object_new_object();
 
 	SD_JOURNAL_FOREACH_DATA(j, get, l) {
@@ -415,6 +442,7 @@ readjournal(void)
 		tv.tv_usec = timestamp % 1000000;
 	}
 
+        /* This should become separate function, e.g. journal_context_update_cursor() for example */
 	/* save journal cursor (at this point we can be sure it is valid) */
 	sd_journal_get_cursor(j, &c);
 	if (c) {
@@ -422,6 +450,7 @@ readjournal(void)
 		last_cursor = c;
 	}
 
+        /* Shouldn't we check error code and log on failure ? */
 	/* submit message */
 	enqMsg((uchar *)message, (uchar *) sys_iden_help, facility, severity, &tv, json, 0);
 
@@ -513,6 +542,8 @@ finalize_it:
 }
 
 
+/* Name of the function is weird, this doesn't skip any old messages because this doesn't take any age or time parameter, w/o such parameter
+ * it doesn't make sense to call something old or new. Function always skips to last real message in journal, hence I'd call it, journal_seek_latest or _last() */
 static rsRetVal
 skipOldMessages(void)
 {
@@ -543,6 +574,7 @@ loadJournalState(void)
 	int r;
 	FILE *r_sf;
 
+        /* Can statefile path change during plugin life cycle */
 	if (cs.stateFile[0] != '/') {
 		char *new_stateFile;
 		if (-1 == asprintf(&new_stateFile, "%s/%s", (char *)glbl.GetWorkDir(), cs.stateFile)) {
@@ -552,6 +584,11 @@ loadJournalState(void)
 		free (cs.stateFile);
 		cs.stateFile = new_stateFile;
 	}
+
+        /* Loading cursor and logic that governs how to position cursor at this boot should be in two different functions
+        /* Or at least visually separated, handle error from fopeN() and fail early then deal with the rest of the stuff
+        /* Generally, check errors and fail early and continue otherwise. Don't nest the code unless it is necessary or helps
+         * readability */
 
 	if ((r_sf = fopen(cs.stateFile, "rb")) != NULL) {
 		char readCursor[128 + 1];
@@ -616,11 +653,14 @@ finalize_it:
 	RETiRet;
 }
 
+/* Again, weird function name. We didn't lost any data and we are not recovering anything, we are reopening journal */
 static void
 tryRecover(void) {
 	LogMsg(0, RS_RET_OK, LOG_INFO, "imjournal: trying to recover from unexpected "
 		"journal error");
 	closeJournal();
+
+        /* This is a policy that should be implemented by the caller */
 	srSleep(10, 0);	// do not hammer machine with too-frequent retries
 	openJournal();
 }
